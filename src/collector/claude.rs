@@ -778,7 +778,9 @@ impl ClaudeCollector {
                 .duration_since(transcript.last_activity)
                 .unwrap_or_default();
             subagents.push(SubAgent {
-                name: truncate(&super::sanitize_terminal_text(description), 30),
+                // Keep task text for the flexible Summary column; bound only
+                // pathological metadata, rather than pre-clipping to a UI width.
+                name: truncate(&super::sanitize_terminal_text(description), 4096),
                 status: if since.as_secs() < 30 {
                     "working"
                 } else {
@@ -3856,6 +3858,23 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             "new models must not inherit a capacity"
         );
         assert_eq!(zero[0].tokens, 1199);
+    }
+
+    #[test]
+    fn subagent_description_is_not_preclipped_to_thirty_characters() {
+        let dir = tempfile::tempdir().unwrap();
+        let description = "Check responsive layout alignment across all breakpoints";
+        fs::write(
+            dir.path().join("agent-layout.meta.json"),
+            serde_json::json!({"description":format!("{description}\u{001b}\n")}).to_string(),
+        )
+        .unwrap();
+        let mut collector = ClaudeCollector::new();
+        let agents = collector.collect_subagents(dir.path());
+        assert_eq!(
+            agents[0].name, description,
+            "the renderer must receive the full sanitized task name"
+        );
     }
 
     #[test]

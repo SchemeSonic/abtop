@@ -1331,10 +1331,10 @@ mod tests {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         let mut session = test_session("parent-session", "parent-project");
         let mut child = test_subagent("claude-sonnet-5-5", Some(47_375), None);
-        child.name = "Inspect layout".into();
+        child.name = "Check responsive layout alignment across all breakpoints".into();
         session.subagents = vec![child];
         app.sessions.push(session);
-        let width = 180;
+        let width = 240;
         let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
         terminal
             .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
@@ -1352,7 +1352,7 @@ mod tests {
         let child_row = 4;
         assert_eq!(
             buffer.cell((summary_start, child_row)).unwrap().symbol(),
-            "I"
+            "C"
         );
         assert!(
             (project_start..session_start).all(|col| buffer
@@ -1362,7 +1362,8 @@ mod tests {
                 == " "),
             "subagent task must not occupy the Project column"
         );
-        assert!(row_text(child_row).contains("Inspect layout"));
+        assert!(row_text(child_row)
+            .contains("Check responsive layout alignment across all breakpoints"));
         assert!(row_text(child_row).contains("sonnet5.5"));
     }
 
