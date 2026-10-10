@@ -92,12 +92,13 @@ pub(crate) fn draw_sessions_panel_active(
     let show_memory = w >= 110;
     let show_turn = w >= 110;
 
+    // Reserve three display cells for the role emoji and its separator.
     let project_w: u16 = if w >= 120 {
-        14
+        17
     } else if w >= 80 {
-        10
+        13
     } else {
-        8
+        11
     };
     let session_w: u16 = if w >= 110 { 9 } else { 5 };
     let session_label = if w >= 110 {
@@ -193,7 +194,7 @@ pub(crate) fn draw_sessions_panel_active(
             )));
         }
         cells.push(Cell::from(Span::styled(
-            truncate_str(&session.project_name, project_w as usize),
+            project_label(&session.project_name, project_w as usize),
             Style::default().fg(theme.title),
         )));
         if show_session_id {
@@ -944,6 +945,28 @@ fn task_row_text(task_text: &str, max_width: usize) -> String {
     truncate_str(&format!("└─ {task_text}"), max_width)
 }
 
+/// Role decoration is display-only; project identifiers stay unchanged.
+fn project_label(project: &str, width: usize) -> String {
+    let normalized = project.to_ascii_lowercase();
+    let icon = if normalized.contains("core") {
+        "🧑‍🏭"
+    } else if normalized.contains("dev") || normalized.contains("web") {
+        "🧑‍🎨"
+    } else {
+        "👨‍🏫"
+    };
+    let icon_width = unicode_width::UnicodeWidthStr::width(icon);
+    if width < icon_width {
+        return String::new();
+    }
+    let name_width = width.saturating_sub(icon_width + 1);
+    if name_width == 0 {
+        return icon.into();
+    }
+    // Truncate only the name so the multi-codepoint emoji is never split.
+    format!("{icon} {}", truncate_str(project, name_width))
+}
+
 pub(crate) fn subagent_model(agent: &SubAgent) -> String {
     if agent.model.is_empty() {
         "—".into()
@@ -1280,6 +1303,53 @@ mod tests {
             context_tokens: context,
             context_window: capacity,
         }
+    }
+
+    #[test]
+    fn project_role_labels_preserve_emoji_sequences_and_fit_display_width() {
+        for (project, icon) in [
+            ("hexmove-web", "🧑‍🎨"),
+            ("hexmove-dev", "🧑‍🎨"),
+            ("HEXMOVE-CORE", "🧑‍🏭"),
+            ("hexmove", "👨‍🏫"),
+            ("dev-core", "🧑‍🏭"),
+            ("ＡＢＣＤ", "👨‍🏫"),
+        ] {
+            for width in 0..=40 {
+                let label = project_label(project, width);
+                assert!(unicode_width::UnicodeWidthStr::width(label.as_str()) <= width);
+                if width >= 2 {
+                    assert!(
+                        label.starts_with(icon),
+                        "emoji sequence split at width {width}"
+                    );
+                }
+            }
+        }
+        assert_eq!(project_label("hexmove-web", 17), "🧑‍🎨 hexmove-web");
+        assert_eq!(project_label("hexmove-core", 17), "🧑‍🏭 hexmove-core");
+        assert_eq!(project_label("hexmove", 17), "👨‍🏫 hexmove");
+    }
+
+    #[test]
+    fn session_project_column_renders_role_prefixes_without_changing_identity() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        app.sessions = ["hexmove-web", "hexmove-core", "hexmove"]
+            .iter()
+            .map(|name| test_session(name, name))
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        for label in ["🧑‍🎨 hexmove-web", "🧑‍🏭 hexmove-core", "👨‍🏫 hexmove"]
+        {
+            assert!(text.contains(label), "role label missing: {label}\n{text}");
+        }
+        assert_eq!(app.sessions[0].project_name, "hexmove-web");
+        assert_eq!(app.sessions[1].project_name, "hexmove-core");
+        assert_eq!(app.sessions[2].project_name, "hexmove");
     }
 
     #[test]

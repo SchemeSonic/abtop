@@ -61,6 +61,13 @@ abtop --mouse            # Enable mouse click/scroll navigation
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
 
+### Project role icons
+
+The sessions table prefixes project names with role icons: 🧑‍🏭 for names
+containing `core`, 🧑‍🎨 for names containing `dev` or `web`, and 👨‍🏫 for the
+remaining manager projects. Matching is case-insensitive, with `core` taking
+priority. The icons are display-only and do not change project identifiers.
+
 ### Subagent models and context
 
 Subagent tree rows are visible below each parent session by default. Press
