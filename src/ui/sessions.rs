@@ -93,7 +93,24 @@ pub(crate) fn draw_sessions_panel_active(
     let show_turn = w >= 110;
 
     // Reserve three display cells for the role emoji and its separator.
-    let project_w: u16 = if w >= 120 {
+    let project_w: u16 = if w >= 160 && app.tree_view {
+        let widest_child = visible
+            .iter()
+            .filter_map(|&index| {
+                let session = &app.sessions[index];
+                (!session.subagents.is_empty()).then(|| {
+                    let label = format!(
+                        "{}-minion-{}",
+                        session.project_name,
+                        session.subagents.len()
+                    );
+                    unicode_width::UnicodeWidthStr::width(label.as_str()) + 3
+                })
+            })
+            .max()
+            .unwrap_or(17);
+        widest_child.clamp(17, 32) as u16
+    } else if w >= 120 {
         17
     } else if w >= 80 {
         13
@@ -309,8 +326,10 @@ pub(crate) fn draw_sessions_panel_active(
                 if show_pid {
                     sa_cells.push(Cell::from(""));
                 }
-                // Project identity belongs to the parent; the task goes in Summary.
-                sa_cells.push(Cell::from(""));
+                sa_cells.push(Cell::from(Span::styled(
+                    subagent_project_label(&session.project_name, sa_idx + 1, project_w as usize),
+                    Style::default().fg(theme.graph_text),
+                )));
                 if show_session_id {
                     sa_cells.push(Cell::from(""));
                 }
@@ -967,6 +986,23 @@ fn project_label(project: &str, width: usize) -> String {
     format!("{icon} {}", truncate_str(project, name_width))
 }
 
+/// Use the parent's role and a session-local row number for child identity.
+fn subagent_project_label(project: &str, number: usize, width: usize) -> String {
+    let full = format!("{project}-minion-{number}");
+    let decorated = project_label(&full, usize::MAX);
+    if unicode_width::UnicodeWidthStr::width(decorated.as_str()) <= width {
+        return decorated;
+    }
+    // Preserve the child number when narrow columns cannot fit the full alias.
+    let suffix = format!("-m{number}");
+    let suffix_width = unicode_width::UnicodeWidthStr::width(suffix.as_str());
+    let prefix_width = width.saturating_sub(suffix_width);
+    if prefix_width < 3 {
+        return project_label(project, width);
+    }
+    format!("{}{suffix}", project_label(project, prefix_width))
+}
+
 pub(crate) fn subagent_model(agent: &SubAgent) -> String {
     if agent.model.is_empty() {
         "—".into()
@@ -1332,6 +1368,59 @@ mod tests {
     }
 
     #[test]
+    fn subagent_aliases_inherit_role_and_keep_numbers_at_narrow_widths() {
+        for (project, icon) in [
+            ("hexmove-web", "🧑‍🎨"),
+            ("hexmove-core", "🧑‍🏭"),
+            ("hexmove", "👨‍🏫"),
+        ] {
+            for number in [1, 2, 12] {
+                assert_eq!(
+                    subagent_project_label(project, number, 32),
+                    format!("{icon} {project}-minion-{number}")
+                );
+                for width in 0..=32 {
+                    let label = subagent_project_label(project, number, width);
+                    assert!(unicode_width::UnicodeWidthStr::width(label.as_str()) <= width);
+                    if width >= 8 {
+                        assert!(
+                            label.ends_with(&format!("-m{number}"))
+                                || label.ends_with(&format!("-minion-{number}"))
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_aliases_are_numbered_per_parent_in_the_project_column() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        for name in ["hexmove-web", "hexmove-core", "hexmove"] {
+            let mut session = test_session(name, name);
+            session.subagents = vec![test_subagent("claude-sonnet-5-5", None, None); 2];
+            app.sessions.push(session);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(240, 40)).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        for (project, icon) in [
+            ("hexmove-web", "🧑‍🎨"),
+            ("hexmove-core", "🧑‍🏭"),
+            ("hexmove", "👨‍🏫"),
+        ] {
+            for number in [1, 2] {
+                assert!(
+                    text.contains(&format!("{icon} {project}-minion-{number}")),
+                    "alias missing\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn session_project_column_renders_role_prefixes_without_changing_identity() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         app.sessions = ["hexmove-web", "hexmove-core", "hexmove"]
@@ -1397,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_task_uses_summary_column_and_project_is_empty() {
+    fn subagent_task_uses_summary_column_and_project_uses_parent_alias() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         let mut session = test_session("parent-session", "parent-project");
         let mut child = test_subagent("claude-sonnet-5-5", Some(47_375), None);
@@ -1424,13 +1513,16 @@ mod tests {
             buffer.cell((summary_start, child_row)).unwrap().symbol(),
             "C"
         );
+        let project = (project_start..session_start)
+            .map(|col| buffer.cell((col, child_row)).unwrap().symbol())
+            .collect::<String>();
         assert!(
-            (project_start..session_start).all(|col| buffer
-                .cell((col, child_row))
-                .unwrap()
-                .symbol()
-                == " "),
-            "subagent task must not occupy the Project column"
+            project.starts_with("👨‍🏫") && project.contains("parent-project-minion-1"),
+            "wrong parent alias: {project}"
+        );
+        assert!(
+            !project.contains("Check responsive"),
+            "task belongs in Summary"
         );
         assert!(row_text(child_row)
             .contains("Check responsive layout alignment across all breakpoints"));

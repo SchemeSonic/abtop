@@ -72,7 +72,10 @@ priority. The icons are display-only and do not change project identifiers.
 
 Subagent tree rows are visible below each parent session by default. Press
 `Shift+T` to collapse or expand them. Subagent task names use the Summary column;
-their Project column is empty because the parent provides that identity.
+their Project column inherits the parent's role icon and uses a session-local
+row label such as `🧑‍🎨 hexmove-web-minion-1`. Numbering starts at 1 for each
+parent in the displayed agent order. Narrow columns use a compact `-m1` suffix
+to retain the number. Wide terminals allocate more space for these labels.
 Select a Claude Code session to see each
 agent's name, status, model, current
 context (`CTX`), and cumulative tokens (`Tok`) in **SUBAGENTS**. Models and
