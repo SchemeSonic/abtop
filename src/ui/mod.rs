@@ -436,7 +436,12 @@ fn desktop_layout(app: &App, area: Rect) -> DesktopLayout {
     let any_mid = !mid_sections.is_empty();
     let mid_h_ideal: u16 = 8;
     let sessions_ideal: u16 = if app.show_sessions {
-        (app.sessions.len() as u16 * 2 + 7).max(8)
+        (app.visible_indices()
+            .iter()
+            .map(|&i| sessions::session_row_count(&app.sessions[i], app.tree_view))
+            .sum::<usize>() as u16
+            + 7)
+        .max(8)
     } else {
         0
     };
@@ -844,14 +849,7 @@ fn session_at(app: &App, area: Rect, row: u16) -> Option<usize> {
     let visible = app.visible_indices();
     let session_rows: u16 = visible
         .iter()
-        .map(|&i| {
-            let base = 2u16;
-            if app.tree_view {
-                base + app.sessions[i].subagents.len() as u16
-            } else {
-                base
-            }
-        })
+        .map(|&i| sessions::session_row_count(&app.sessions[i], app.tree_view) as u16)
         .sum();
     let detail_reserve: u16 = if app.show_timeline {
         (inner_h * 2 / 3).min(inner_h.saturating_sub(5))
@@ -872,33 +870,17 @@ fn session_at(app: &App, area: Rect, row: u16) -> Option<usize> {
     let selected_row_start: usize = visible
         .iter()
         .take(selected_pos)
-        .map(|&i| {
-            let base = 2;
-            if app.tree_view {
-                base + app.sessions[i].subagents.len()
-            } else {
-                base
-            }
-        })
+        .map(|&i| sessions::session_row_count(&app.sessions[i], app.tree_view))
         .sum();
-    let selected_session_rows = if app.tree_view {
-        2 + app
-            .sessions
-            .get(app.selected)
-            .map_or(0, |s| s.subagents.len())
-    } else {
-        2
-    };
+    let selected_session_rows = app.sessions.get(app.selected).map_or(0, |session| {
+        sessions::session_row_count(session, app.tree_view)
+    });
     let scroll_offset =
         (selected_row_start + selected_session_rows.min(visible_rows)).saturating_sub(visible_rows);
     let target_row = scroll_offset + row.saturating_sub(table_y + 1) as usize;
     let mut offset = 0usize;
     for &idx in &visible {
-        let rows = if app.tree_view {
-            2 + app.sessions[idx].subagents.len()
-        } else {
-            2
-        };
+        let rows = sessions::session_row_count(&app.sessions[idx], app.tree_view);
         if target_row >= offset && target_row < offset + rows {
             return Some(idx);
         }
@@ -1287,6 +1269,34 @@ mod tests {
             !text.contains("tokens"),
             "zoomed tab should hide peer sections\n{text}"
         );
+    }
+
+    #[test]
+    fn session_click_mapping_matches_inline_rows_and_scrolling() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        crate::demo::populate_demo(&mut app);
+        let area = Rect::new(0, 0, 240, 30);
+        assert_eq!(session_at(&app, area, 2), Some(0));
+        assert_eq!(session_at(&app, area, 3), Some(0));
+        assert_eq!(session_at(&app, area, 4), Some(0));
+        assert_eq!(session_at(&app, area, 5), Some(1));
+        app.tree_view = false;
+        assert_eq!(session_at(&app, area, 3), Some(1));
+        app.tree_view = true;
+        let child = app.sessions[0].subagents[0].clone();
+        app.sessions[0].subagents = vec![child; 20];
+        app.selected = 1;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(240, 30)).unwrap();
+        terminal
+            .draw(|f| sessions::draw_sessions_panel(f, &app, area, &app.theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let selected_row = (2..area.height)
+            .find(|&row| buffer.cell((1, row)).unwrap().symbol() == "►")
+            .unwrap();
+        assert_eq!(session_at(&app, area, selected_row), Some(1));
+        assert_eq!(session_at(&app, area, selected_row - 1), Some(0));
     }
 
     #[test]

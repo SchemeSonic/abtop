@@ -82,6 +82,10 @@ context (`CTX`), and cumulative tokens (`Tok`) in **SUBAGENTS**. Models and
 context come from each subagent's own latest valid assistant records, including
 live updates. The same fields appear in `--once` and `--json` snapshots.
 
+Session summaries and current activity share one row: `Title · waiting for input`.
+Subagent rows follow their parent immediately. Long titles and activity labels
+are shortened to fit the Summary column while preserving the other columns.
+
 Subagent Status cells show `● Work` or `✓ Done` (compact `● W`/`✓ D` on
 narrow terminals). This preserves the existing activity heuristic: a transcript
 modified in the last 30 seconds is working; an older transcript is done.

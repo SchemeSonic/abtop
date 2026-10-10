@@ -35,14 +35,7 @@ pub(crate) fn draw_sessions_panel_active(
     let visible = app.visible_indices();
     let session_rows: u16 = visible
         .iter()
-        .map(|&i| {
-            let base = 2u16;
-            if app.tree_view {
-                base + app.sessions[i].subagents.len() as u16
-            } else {
-                base
-            }
-        })
+        .map(|&i| session_row_count(&app.sessions[i], app.tree_view) as u16)
         .sum();
     let detail_reserve: u16 = if app.show_timeline {
         (inner.height * 2 / 3).min(inner.height.saturating_sub(5))
@@ -145,6 +138,53 @@ pub(crate) fn draw_sessions_panel_active(
     };
     let tokens_w: u16 = if w >= 100 { 7 } else { 5 };
 
+    let mut widths_vec: Vec<Constraint> = vec![
+        Constraint::Length(1), // marker
+        Constraint::Length(4), // agent label (+1 for the App/IDE suffix letter)
+    ];
+    if show_pid {
+        widths_vec.push(Constraint::Length(6)); // pid
+    }
+    widths_vec.push(Constraint::Length(project_w)); // project
+    if show_session_id {
+        widths_vec.push(Constraint::Length(session_w)); // session id
+    }
+    if show_config {
+        widths_vec.push(Constraint::Length(config_w)); // config root
+    }
+    widths_vec.push(Constraint::Fill(1)); // summary (fills remaining)
+    widths_vec.push(Constraint::Length(status_w)); // status
+    if show_model {
+        widths_vec.push(Constraint::Length(model_w)); // model
+    }
+    widths_vec.push(Constraint::Length(context_w)); // context
+    if show_tokens {
+        widths_vec.push(Constraint::Length(tokens_w)); // tokens
+    }
+    if show_memory {
+        widths_vec.push(Constraint::Length(8)); // memory
+    }
+    if show_turn {
+        widths_vec.push(Constraint::Length(4)); // turn
+    }
+
+    // Match Table's one-cell column spacing and optional scrollbar.
+    let fixed_width: u16 = widths_vec
+        .iter()
+        .filter_map(|constraint| {
+            if let Constraint::Length(width) = constraint {
+                Some(*width)
+            } else {
+                None
+            }
+        })
+        .sum();
+    let scrollbar_width = u16::from(session_rows > table_h.saturating_sub(1) && w > 2);
+    let summary_width = w
+        .saturating_sub(scrollbar_width)
+        .saturating_sub(fixed_width)
+        .saturating_sub(widths_vec.len().saturating_sub(1) as u16) as usize;
+
     let visible = app.visible_indices();
     for &i in &visible {
         let session = &app.sessions[i];
@@ -227,9 +267,15 @@ pub(crate) fn draw_sessions_panel_active(
             )));
         }
         cells.extend([
-            Cell::from(Span::styled(
-                truncate_str(&summary_col, w.saturating_sub(24) as usize),
-                Style::default().fg(theme.main_fg),
+            Cell::from(session_summary_line(
+                &summary_col,
+                session
+                    .current_tasks
+                    .last()
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                summary_width,
+                theme,
             )),
             Cell::from(Span::styled(
                 truncate_str(&status_icon_str, status_w as usize),
@@ -274,35 +320,6 @@ pub(crate) fn draw_sessions_panel_active(
         }
 
         rows.push(Row::new(cells).style(row_style).height(1));
-
-        // 2nd line: task text in Summary column
-        let summary_idx = 3 + show_pid as usize + show_session_id as usize + show_config as usize;
-        let total_cols = 6
-            + show_pid as usize
-            + show_session_id as usize
-            + show_config as usize
-            + show_model as usize
-            + show_tokens as usize
-            + show_memory as usize
-            + show_turn as usize;
-        let task_cells: Vec<Cell> = (0..total_cols)
-            .map(|j| {
-                if j == summary_idx {
-                    let task_text = session
-                        .current_tasks
-                        .last()
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
-                    Cell::from(Span::styled(
-                        task_row_text(task_text, w.saturating_sub(24) as usize),
-                        Style::default().fg(theme.graph_text),
-                    ))
-                } else {
-                    Cell::from("")
-                }
-            })
-            .collect();
-        rows.push(Row::new(task_cells).height(1));
 
         // Tree view: show subagents as indented rows
         if app.tree_view && !session.subagents.is_empty() {
@@ -412,36 +429,6 @@ pub(crate) fn draw_sessions_panel_active(
     }
     let header = Row::new(header_cells).height(1);
 
-    let mut widths_vec: Vec<Constraint> = vec![
-        Constraint::Length(1), // marker
-        Constraint::Length(4), // agent label (+1 for the App/IDE suffix letter)
-    ];
-    if show_pid {
-        widths_vec.push(Constraint::Length(6)); // pid
-    }
-    widths_vec.push(Constraint::Length(project_w)); // project
-    if show_session_id {
-        widths_vec.push(Constraint::Length(session_w)); // session id
-    }
-    if show_config {
-        widths_vec.push(Constraint::Length(config_w)); // config root
-    }
-    widths_vec.push(Constraint::Fill(1)); // summary (fills remaining)
-    widths_vec.push(Constraint::Length(status_w)); // status
-    if show_model {
-        widths_vec.push(Constraint::Length(model_w)); // model
-    }
-    widths_vec.push(Constraint::Length(context_w)); // context
-    if show_tokens {
-        widths_vec.push(Constraint::Length(tokens_w)); // tokens
-    }
-    if show_memory {
-        widths_vec.push(Constraint::Length(8)); // memory
-    }
-    if show_turn {
-        widths_vec.push(Constraint::Length(4)); // turn
-    }
-
     // Scroll: rows vary per session in tree view; use the built row list as the source of truth.
     let visible_sessions = app.visible_indices();
     let total_rows = rows.len();
@@ -472,23 +459,12 @@ pub(crate) fn draw_sessions_panel_active(
     let selected_row_start: usize = visible_sessions
         .iter()
         .take(selected_pos)
-        .map(|&i| {
-            let base = 2;
-            if app.tree_view {
-                base + app.sessions[i].subagents.len()
-            } else {
-                base
-            }
-        })
+        .map(|&i| session_row_count(&app.sessions[i], app.tree_view))
         .sum();
-    let selected_session_rows = if app.tree_view {
-        2 + app
-            .sessions
-            .get(app.selected)
-            .map_or(0, |s| s.subagents.len())
-    } else {
-        2
-    };
+    let selected_session_rows = app
+        .sessions
+        .get(app.selected)
+        .map_or(0, |session| session_row_count(session, app.tree_view));
     // Keep the parent visible when its subtree is taller than the table.
     let selected_row_end = selected_row_start + selected_session_rows.min(visible_rows);
     let scroll_offset = selected_row_end.saturating_sub(visible_rows);
@@ -962,8 +938,33 @@ fn draw_file_audit(f: &mut Frame, session: &AgentSession, area: Rect, theme: &Th
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn task_row_text(task_text: &str, max_width: usize) -> String {
-    truncate_str(&format!("└─ {task_text}"), max_width)
+/// One parent row, followed immediately by its expanded subagents.
+pub(super) fn session_row_count(session: &AgentSession, tree_view: bool) -> usize {
+    1 + if tree_view {
+        session.subagents.len()
+    } else {
+        0
+    }
+}
+
+fn session_summary_line(summary: &str, task: &str, width: usize, theme: &Theme) -> Line<'static> {
+    let task = task.trim();
+    let title_style = Style::default().fg(theme.main_fg);
+    if task.is_empty() || width <= 6 {
+        return Line::from(Span::styled(truncate_str(summary, width), title_style));
+    }
+    let task_width = unicode_width::UnicodeWidthStr::width(task);
+    let title_budget = width.saturating_sub(3 + task_width.min(width / 2));
+    let title = truncate_str(summary, title_budget);
+    let remaining = width.saturating_sub(unicode_width::UnicodeWidthStr::width(title.as_str()) + 3);
+    let activity_style = Style::default()
+        .fg(theme.graph_text)
+        .remove_modifier(Modifier::BOLD);
+    Line::from(vec![
+        Span::styled(title, title_style),
+        Span::styled(" · ", activity_style),
+        Span::styled(truncate_str(task, remaining), activity_style),
+    ])
 }
 
 /// Role decoration is display-only; project identifiers stay unchanged.
@@ -1386,6 +1387,53 @@ mod tests {
     }
 
     #[test]
+    fn session_activity_is_inline_and_children_follow_without_a_gap() {
+        for width in [80, 120, 240] {
+            let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+            let mut parent = test_session("parent-session", "hexmove-web");
+            parent.subagents = vec![test_subagent("claude-sonnet-5-5", None, None)];
+            app.summaries.insert(
+                parent.session_id.clone(),
+                "Fix Esc Exiting Full Screen".into(),
+            );
+            app.sessions = vec![parent, test_session("next-session", "core")];
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            for expanded in [true, false] {
+                app.tree_view = expanded;
+                terminal
+                    .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let row_text = |row| {
+                    (0..width)
+                        .map(|col| buffer.cell((col, row)).unwrap().symbol())
+                        .collect::<String>()
+                };
+                let parent_row = row_text(2);
+                assert!(
+                    parent_row.contains("Fix") && parent_row.contains(" · wait"),
+                    "activity missing at {width}: {parent_row}"
+                );
+                if width == 240 {
+                    assert!(parent_row.contains("Fix Esc Exiting Full Screen · waiting for input"));
+                }
+                if expanded {
+                    assert!(
+                        row_text(3).contains("sonnet5.5"),
+                        "child must immediately follow parent"
+                    );
+                }
+                let next_row = if expanded { 4 } else { 3 };
+                assert!(
+                    row_text(next_row).contains("core"),
+                    "next session must have no spacer row at {width}: {}",
+                    row_text(next_row)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn subagent_status_column_shows_work_done_and_compact_labels() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         let mut session = test_session("parent-session", "hexmove-web");
@@ -1557,7 +1605,7 @@ mod tests {
         let project_start = header[..header.find("Project").unwrap()].chars().count() as u16;
         let session_start = header[..header.find("Session").unwrap()].chars().count() as u16;
         let summary_start = header[..header.find("Summary").unwrap()].chars().count() as u16;
-        let child_row = 4;
+        let child_row = 3;
         assert_eq!(
             buffer.cell((summary_start, child_row)).unwrap().symbol(),
             "C"
@@ -1864,20 +1912,39 @@ mod tests {
     }
 
     #[test]
-    fn task_row_text_respects_terminal_display_width() {
-        assert_eq!(task_row_text("ＡＢＣＤ", 6), "└─ Ａ…");
+    fn inline_summary_respects_display_width_and_handles_empty_activity() {
+        let theme = Theme::default();
+        for width in 0..=90 {
+            let line =
+                session_summary_line("Wide ＡＢＣＤ title", "Bash cargo test", width, &theme);
+            assert!(line.width() <= width, "summary exceeds {width} cells");
+            if width >= 20 {
+                assert!(line.to_string().contains(" · Bash"));
+            }
+        }
+        assert_eq!(
+            session_summary_line("Title", "  ", 40, &theme).to_string(),
+            "Title"
+        );
+        assert_eq!(
+            session_summary_line(
+                "Fix Esc Exiting Full Screen",
+                "waiting for input",
+                80,
+                &theme
+            )
+            .to_string(),
+            "Fix Esc Exiting Full Screen · waiting for input"
+        );
     }
 
     #[test]
     fn session_table_clears_rows_when_selection_scrolls() {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
-        app.sessions = vec![
-            test_session("first111", "first"),
-            test_session("second22", "second"),
-            test_session("third333", "third"),
-            test_session("fourth44", "fourth"),
-        ];
-        app.selected = 3;
+        app.sessions = (0..8)
+            .map(|index| test_session(&format!("session-{index}"), &format!("project-{index}")))
+            .collect();
+        app.selected = 7;
 
         let backend = TestBackend::new(120, 14);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1901,14 +1968,14 @@ mod tests {
             .draw(|f| draw_sessions_panel(f, &app, area, &app.theme))
             .unwrap();
 
-        app.selected = 2;
+        app.selected = 6;
         terminal
             .draw(|f| draw_sessions_panel(f, &app, area, &app.theme))
             .unwrap();
 
         let text = format!("{}", terminal.backend());
         assert!(
-            !text.contains("STALE") && !text.contains("fourth44"),
+            !text.contains("STALE") && !text.contains("session-7"),
             "offscreen session row should be cleared after selection scroll\n{text}"
         );
     }
@@ -1942,7 +2009,7 @@ mod tests {
 
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(1, 2)].symbol(), " ");
-        assert_eq!(buffer[(1, 4)].symbol(), "►");
+        assert_eq!(buffer[(1, 3)].symbol(), "►");
     }
 
     fn test_session(session_id: &str, project_name: &str) -> AgentSession {
