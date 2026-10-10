@@ -82,6 +82,11 @@ context (`CTX`), and cumulative tokens (`Tok`) in **SUBAGENTS**. Models and
 context come from each subagent's own latest valid assistant records, including
 live updates. The same fields appear in `--once` and `--json` snapshots.
 
+Subagent Status cells show `● Work` or `✓ Done` (compact `● W`/`✓ D` on
+narrow terminals). This preserves the existing activity heuristic: a transcript
+modified in the last 30 seconds is working; an older transcript is done.
+It is an activity estimate rather than an explicit completion event.
+
 Context is separate from cumulative tokens. Known capacities display a
 percentage; unfamiliar models display the current context token count instead.
 Missing model or usage displays `—`. The parent model and its `[1m]` setting

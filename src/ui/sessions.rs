@@ -312,7 +312,6 @@ pub(crate) fn draw_sessions_panel_active(
                 let prefix = if is_last { "└─" } else { "├─" };
                 let is_working = sa.status.eq_ignore_ascii_case("working")
                     || sa.status.eq_ignore_ascii_case("in_progress");
-                let icon = if is_working { "●" } else { "✓" };
                 let sa_fg = if is_working {
                     theme.proc_misc
                 } else {
@@ -345,7 +344,10 @@ pub(crate) fn draw_sessions_panel_active(
                 };
                 sa_cells.extend([
                     Cell::from(Span::styled(summary, Style::default().fg(theme.graph_text))),
-                    Cell::from(Span::styled(icon, Style::default().fg(sa_fg))),
+                    Cell::from(Span::styled(
+                        subagent_status(sa, status_w as usize),
+                        Style::default().fg(sa_fg),
+                    )),
                 ]);
                 if show_model {
                     sa_cells.push(Cell::from(Span::styled(
@@ -1003,6 +1005,22 @@ fn subagent_project_label(project: &str, number: usize, width: usize) -> String 
     format!("{}{suffix}", project_label(project, prefix_width))
 }
 
+fn subagent_status(agent: &SubAgent, width: usize) -> String {
+    let (full, short, icon) = match agent.status.to_ascii_lowercase().as_str() {
+        "working" | "in_progress" => ("● Work", "● W", "●"),
+        "done" => ("✓ Done", "✓ D", "✓"),
+        _ => ("? Unk", "? U", "?"),
+    };
+    let label = if width >= unicode_width::UnicodeWidthStr::width(full) {
+        full
+    } else if width >= 3 {
+        short
+    } else {
+        icon
+    };
+    truncate_str(label, width)
+}
+
 pub(crate) fn subagent_model(agent: &SubAgent) -> String {
     if agent.model.is_empty() {
         "—".into()
@@ -1365,6 +1383,37 @@ mod tests {
         assert_eq!(project_label("hexmove-web", 17), "🧑‍🎨 hexmove-web");
         assert_eq!(project_label("hexmove-core", 17), "🧑‍🏭 hexmove-core");
         assert_eq!(project_label("hexmove", 17), "👨‍🏫 hexmove");
+    }
+
+    #[test]
+    fn subagent_status_column_shows_work_done_and_compact_labels() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut session = test_session("parent-session", "hexmove-web");
+        let working = test_subagent("claude-sonnet-5-5", None, None);
+        let mut done = working.clone();
+        done.status = "done".into();
+        session.subagents = vec![working, done];
+        app.sessions.push(session);
+        let mut terminal = Terminal::new(TestBackend::new(180, 30)).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        let table = text.split("SESSION (").next().unwrap();
+        assert!(table.contains("● Work"), "working label missing\n{text}");
+        assert!(table.contains("✓ Done"), "done label missing\n{text}");
+        let mut agent = app.sessions[0].subagents[0].clone();
+        assert_eq!(subagent_status(&agent, 3), "● W");
+        agent.status = "done".into();
+        assert_eq!(subagent_status(&agent, 3), "✓ D");
+        agent.status = "unknown".into();
+        assert_eq!(subagent_status(&agent, 8), "? Unk");
+        for width in 0..=8 {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(subagent_status(&agent, width).as_str())
+                    <= width
+            );
+        }
     }
 
     #[test]
