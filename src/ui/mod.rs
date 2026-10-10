@@ -889,7 +889,8 @@ fn session_at(app: &App, area: Rect, row: u16) -> Option<usize> {
     } else {
         2
     };
-    let scroll_offset = (selected_row_start + selected_session_rows).saturating_sub(visible_rows);
+    let scroll_offset =
+        (selected_row_start + selected_session_rows.min(visible_rows)).saturating_sub(visible_rows);
     let target_row = scroll_offset + row.saturating_sub(table_y + 1) as usize;
     let mut offset = 0usize;
     for &idx in &visible {

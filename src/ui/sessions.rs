@@ -308,18 +308,23 @@ pub(crate) fn draw_sessions_panel_active(
                 if show_pid {
                     sa_cells.push(Cell::from(""));
                 }
-                sa_cells.push(Cell::from(Span::styled(
-                    truncate_str(&sa.name, project_w as usize),
-                    Style::default().fg(theme.graph_text),
-                )));
+                // Project identity belongs to the parent; the task goes in Summary.
+                sa_cells.push(Cell::from(""));
                 if show_session_id {
                     sa_cells.push(Cell::from(""));
                 }
                 if show_config {
                     sa_cells.push(Cell::from(""));
                 }
+                // Use the flexible summary column for the full task name.
+                // When the model column is hidden, put the model first here.
+                let summary = if show_model {
+                    sa.name.clone()
+                } else {
+                    format!("{} · {}", subagent_model(sa), sa.name)
+                };
                 sa_cells.extend([
-                    Cell::from(""),
+                    Cell::from(Span::styled(summary, Style::default().fg(theme.graph_text))),
                     Cell::from(Span::styled(icon, Style::default().fg(sa_fg))),
                 ]);
                 if show_model {
@@ -462,7 +467,8 @@ pub(crate) fn draw_sessions_panel_active(
     } else {
         2
     };
-    let selected_row_end = selected_row_start + selected_session_rows;
+    // Keep the parent visible when its subtree is taller than the table.
+    let selected_row_end = selected_row_start + selected_session_rows.min(visible_rows);
     let scroll_offset = selected_row_end.saturating_sub(visible_rows);
     let visible = if scroll_offset < rows.len() {
         rows.into_iter().skip(scroll_offset).collect::<Vec<_>>()
@@ -1274,6 +1280,109 @@ mod tests {
             context_tokens: context,
             context_window: capacity,
         }
+    }
+
+    #[test]
+    fn default_tree_places_child_model_below_parent_without_a_toggle() {
+        for width in [60, 80, 120, 180] {
+            let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+            assert!(app.tree_view, "subagents must be visible on startup");
+            let mut session = test_session("parent-session", "parent-project");
+            session.model = "claude-opus-5-5".into();
+            let mut child = test_subagent("claude-sonnet-5-5", Some(47_375), None);
+            child.name = "Inspect layout".into();
+            session.subagents = vec![child];
+            app.sessions.push(session);
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+                .unwrap();
+            let text = format!("{}", terminal.backend());
+            // Inspect only the table, so the detail panel cannot hide a regression.
+            let table = text.split("SESSION (").next().unwrap();
+            assert!(
+                table.contains("sonnet5.5"),
+                "child model missing at {width}\n{text}"
+            );
+            let parent_row = table.lines().position(|line| line.contains("►")).unwrap();
+            let child_row = table
+                .lines()
+                .position(|line| line.contains("sonnet5.5"))
+                .unwrap();
+            assert!(
+                child_row > parent_row,
+                "child must appear below parent\n{text}"
+            );
+            app.tree_view = false;
+            terminal
+                .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+                .unwrap();
+            let collapsed = format!("{}", terminal.backend());
+            let table = collapsed.split("SESSION (").next().unwrap();
+            assert!(
+                !table.contains("sonnet5.5"),
+                "toggle must still collapse the subtree"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_task_uses_summary_column_and_project_is_empty() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut session = test_session("parent-session", "parent-project");
+        let mut child = test_subagent("claude-sonnet-5-5", Some(47_375), None);
+        child.name = "Inspect layout".into();
+        session.subagents = vec![child];
+        app.sessions.push(session);
+        let width = 180;
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row_text = |row| {
+            (0..width)
+                .map(|col| buffer.cell((col, row)).unwrap().symbol())
+                .collect::<String>()
+        };
+        let header = row_text(1);
+        let project_start = header[..header.find("Project").unwrap()].chars().count() as u16;
+        let session_start = header[..header.find("Session").unwrap()].chars().count() as u16;
+        let summary_start = header[..header.find("Summary").unwrap()].chars().count() as u16;
+        let child_row = 4;
+        assert_eq!(
+            buffer.cell((summary_start, child_row)).unwrap().symbol(),
+            "I"
+        );
+        assert!(
+            (project_start..session_start).all(|col| buffer
+                .cell((col, child_row))
+                .unwrap()
+                .symbol()
+                == " "),
+            "subagent task must not occupy the Project column"
+        );
+        assert!(row_text(child_row).contains("Inspect layout"));
+        assert!(row_text(child_row).contains("sonnet5.5"));
+    }
+
+    #[test]
+    fn tall_subagent_tree_keeps_parent_visible_in_small_table() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut session = test_session("parent-session", "parent-project");
+        session.subagents = (0..20)
+            .map(|_| test_subagent("claude-sonnet-5-5", None, None))
+            .collect();
+        app.sessions.push(session);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(
+            text.contains("►"),
+            "selected parent scrolled out of view\n{text}"
+        );
     }
 
     #[test]

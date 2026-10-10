@@ -63,7 +63,11 @@ Mouse capture is off by default so terminal drag selection and copy keep working
 
 ### Subagent models and context
 
-Select a Claude Code session to see each agent's name, status, model, current
+Subagent tree rows are visible below each parent session by default. Press
+`Shift+T` to collapse or expand them. Subagent task names use the Summary column;
+their Project column is empty because the parent provides that identity.
+Select a Claude Code session to see each
+agent's name, status, model, current
 context (`CTX`), and cumulative tokens (`Tok`) in **SUBAGENTS**. Models and
 context come from each subagent's own latest valid assistant records, including
 live updates. The same fields appear in `--once` and `--json` snapshots.

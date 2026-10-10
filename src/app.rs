@@ -204,7 +204,7 @@ impl App {
             mcp_suppress_sessions: true,
             config_open: false,
             config_selected: 0,
-            tree_view: false,
+            tree_view: true,
             filter_text: String::new(),
             filter_active: false,
             show_timeline: false,
