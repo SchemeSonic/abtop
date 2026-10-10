@@ -483,6 +483,23 @@ fn print_snapshot(app: &App) {
         if let Some(task) = session.current_tasks.last() {
             println!("       └─ {}", sanitize_output(task));
         }
+        if !session.subagents.is_empty() {
+            println!("       SUBAGENTS");
+            for agent in &session.subagents {
+                println!(
+                    "         {} {} {} CTX:{} Tok:{}",
+                    if agent.status == "working" {
+                        "●"
+                    } else {
+                        "✓"
+                    },
+                    sanitize_output(&agent.name),
+                    ui::subagent_model(agent),
+                    ui::subagent_context(agent),
+                    fmt_tok(agent.tokens)
+                );
+            }
+        }
         for child in &session.children {
             let port = child.port.map(|p| format!(":{}", p)).unwrap_or_default();
             println!(

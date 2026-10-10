@@ -8,6 +8,7 @@ mod ports;
 mod projects;
 mod quota;
 mod sessions;
+pub(crate) use sessions::{subagent_context, subagent_model};
 mod tokens;
 mod view_menu;
 

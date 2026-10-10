@@ -80,6 +80,9 @@ pub struct SubAgentView {
     pub status: String,
     /// Tokens attributed to this subagent.
     pub tokens: u64,
+    pub model: String,
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<u64>,
 }
 
 /// A single session, flattened and curated for JSON consumers.
@@ -241,6 +244,9 @@ impl App {
                         name: a.name.clone(),
                         status: a.status.clone(),
                         tokens: a.tokens,
+                        model: a.model.clone(),
+                        context_tokens: a.context_tokens,
+                        context_window: a.context_window,
                     })
                     .collect(),
                 tool_calls: tail(&s.tool_calls, 24)
@@ -306,6 +312,17 @@ mod tests {
         let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
         populate_demo(&mut app);
         app
+    }
+
+    #[test]
+    fn snapshot_exposes_subagent_model_and_optional_context() {
+        let app = demo_app();
+        let json = serde_json::to_value(app.to_snapshot(2000)).unwrap();
+        let agent = &json["sessions"][0]["subagents"][0];
+        assert_eq!(agent["model"], "claude-haiku-4-5");
+        assert_eq!(agent["context_tokens"], 6_000);
+        assert_eq!(agent["context_window"], 200_000);
+        assert_eq!(agent["tokens"], 12_400);
     }
 
     #[test]

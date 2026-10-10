@@ -54,6 +54,8 @@ pub struct ClaudeCollector {
     /// Cached transcript parse results keyed by session_id.
     /// On each tick, only new bytes since `new_offset` are parsed.
     transcript_cache: HashMap<String, TranscriptResult>,
+    /// Compact per-transcript metrics, with the same offset/rotation strategy.
+    subagent_cache: HashMap<PathBuf, SubAgentTranscript>,
 }
 
 impl ClaudeCollector {
@@ -67,6 +69,7 @@ impl ClaudeCollector {
             config_dirs: Vec::new(),
             configured_config_dirs,
             transcript_cache: HashMap::new(),
+            subagent_cache: HashMap::new(),
         }
     }
 
@@ -177,6 +180,13 @@ impl ClaudeCollector {
             sessions.iter().map(|s| s.session_id.as_str()).collect();
         self.transcript_cache
             .retain(|sid, _| active_ids.contains(sid.as_str()));
+        self.subagent_cache.retain(|path, _| {
+            path.parent()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .is_some_and(|sid| active_ids.contains(sid))
+        });
     }
 
     fn load_session_paths(
@@ -446,13 +456,14 @@ impl ClaudeCollector {
                     prev.total_output += delta.total_output;
                     prev.total_cache_read += delta.total_cache_read;
                     prev.total_cache_create += delta.total_cache_create;
-                    if delta.last_context_tokens > 0 {
+                    if delta.has_context_usage {
                         prev.last_context_tokens = delta.last_context_tokens;
+                        prev.has_context_usage = true;
                     }
                     if delta.max_context_tokens > prev.max_context_tokens {
                         prev.max_context_tokens = delta.max_context_tokens;
                     }
-                    if delta.last_context_tokens > 0 {
+                    if delta.has_context_usage {
                         prev.prev_cache_read = delta.prev_cache_read;
                     }
                     prev.compaction_count += delta.compaction_count;
@@ -519,6 +530,7 @@ impl ClaudeCollector {
             total_cache_read: 0,
             total_cache_create: 0,
             last_context_tokens: 0,
+            has_context_usage: false,
             max_context_tokens: 0,
             prev_cache_read: 0,
             context_history: Vec::new(),
@@ -564,6 +576,8 @@ impl ClaudeCollector {
         let chat_messages = cached.chat_messages.clone();
         let tool_calls = cached.tool_calls.clone();
         let file_accesses = cached.file_accesses.clone();
+        let pending_since_ms = cached.last_assistant_ts_ms;
+        let thinking_since_ms = cached.last_user_ts_ms;
 
         if !pid_alive {
             return None;
@@ -579,7 +593,7 @@ impl ClaudeCollector {
         // Collect subagents before deriving the parent status so asynchronous
         // Agent work keeps the parent active after its tool_result has returned.
         let subagents_dir = project_dir.join(&sf.session_id).join("subagents");
-        let subagents = Self::collect_subagents(&subagents_dir);
+        let subagents = self.collect_subagents(&subagents_dir);
         let has_working_subagent = subagents.iter().any(|agent| agent.status == "working");
 
         // Status is best-effort. Signals we trust:
@@ -608,8 +622,8 @@ impl ClaudeCollector {
             // Non-empty current_task = latest assistant turn left a tool_use
             // unanswered. Catches fast tools (`Bash rm ...`) that finish
             // between CPU samples, so has_active_descendant alone misses them.
-            let pending_tool = !cached.current_task.is_empty();
-            let model_generating = cached.last_user_ts_ms > 0;
+            let pending_tool = !current_task.is_empty();
+            let model_generating = thinking_since_ms > 0;
             if has_active_descendant || pending_tool || has_working_subagent {
                 SessionStatus::Executing
             } else if model_generating {
@@ -620,7 +634,11 @@ impl ClaudeCollector {
         };
 
         let configured_model = read_configured_model(&sf.cwd);
-        let context_window = crate::collector::context_window_for_model(&model, &configured_model, max_context_tokens);
+        let context_window = crate::collector::context_window_for_model(
+            &model,
+            &configured_model,
+            max_context_tokens,
+        );
         let context_percent = if context_window > 0 {
             (last_context_tokens as f64 / context_window as f64) * 100.0
         } else {
@@ -708,102 +726,114 @@ impl ClaudeCollector {
             first_assistant_text,
             chat_messages,
             tool_calls,
-            pending_since_ms: cached.last_assistant_ts_ms,
-            thinking_since_ms: cached.last_user_ts_ms,
+            pending_since_ms,
+            thinking_since_ms,
             file_accesses,
             config_root: super::abbrev_path(&config.base_dir()),
         })
     }
 
-    fn collect_subagents(subagents_dir: &Path) -> Vec<SubAgent> {
-        let mut subagents = Vec::new();
-
-        let entries = match fs::read_dir(subagents_dir) {
-            Ok(e) => e,
-            Err(_) => return subagents,
-        };
-
-        // Collect meta files and their corresponding jsonl files
-        let mut meta_files: Vec<PathBuf> = Vec::new();
-        for entry in entries.flatten() {
-            if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(true) {
-                continue;
-            }
-            let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.ends_with(".meta.json") {
-                    meta_files.push(path);
+    fn collect_subagents(&mut self, subagents_dir: &Path) -> Vec<SubAgent> {
+        // Discover both sidecars and transcripts: metadata is optional and may
+        // arrive after the transcript, be malformed, or disappear mid-scan.
+        let mut stems = std::collections::BTreeSet::new();
+        if let Ok(entries) = fs::read_dir(subagents_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
+                    continue;
                 }
-            }
-        }
-
-        for meta_path in meta_files {
-            let meta_name = match meta_path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-
-            // Parse meta JSON
-            let meta_content = match fs::read_to_string(&meta_path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            let meta_val: Value = match serde_json::from_str(&meta_content) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            let description = meta_val
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("agent")
-                .to_string();
-
-            // Derive jsonl path: agent-{hash}.meta.json -> agent-{hash}.jsonl
-            let jsonl_name = meta_name.replace(".meta.json", ".jsonl");
-            let jsonl_path = meta_path.with_file_name(&jsonl_name);
-
-            let mut tokens = 0u64;
-            let mut last_activity = std::time::UNIX_EPOCH;
-
-            if jsonl_path.exists() {
-                // Get file mtime for status
-                if let Ok(metadata) = fs::metadata(&jsonl_path) {
-                    if let Ok(mtime) = metadata.modified() {
-                        last_activity = mtime;
+                let path = entry.path();
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if let Some(stem) = name
+                        .strip_suffix(".meta.json")
+                        .or_else(|| name.strip_suffix(".jsonl"))
+                    {
+                        if stem.starts_with("agent-") {
+                            stems.insert(stem.to_string());
+                        }
                     }
                 }
-
-                // Parse jsonl for token totals
-                let transcript = parse_transcript(&jsonl_path, 0);
-                tokens = transcript.total_input
-                    + transcript.total_output
-                    + transcript.total_cache_read
-                    + transcript.total_cache_create;
             }
-
-            let status = {
-                let since = std::time::SystemTime::now()
-                    .duration_since(last_activity)
-                    .unwrap_or_default();
-                if since.as_secs() < 30 {
-                    "working".to_string()
-                } else {
-                    "done".to_string()
-                }
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut subagents = Vec::new();
+        for stem in stems {
+            let meta_path = subagents_dir.join(format!("{stem}.meta.json"));
+            let metadata: Option<Value> = if !is_symlink(&meta_path) {
+                fs::read_to_string(&meta_path)
+                    .ok()
+                    .and_then(|text| serde_json::from_str(&text).ok())
+            } else {
+                None
             };
-
-            // Use description as name, shorten if needed
-            let name = truncate(&description, 30);
-
+            let description = metadata
+                .as_ref()
+                .and_then(|meta| meta.get("description").and_then(Value::as_str))
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or(&stem);
+            let jsonl_path = subagents_dir.join(format!("{stem}.jsonl"));
+            seen.insert(jsonl_path.clone());
+            let transcript = self.read_subagent_transcript(&jsonl_path);
+            let since = std::time::SystemTime::now()
+                .duration_since(transcript.last_activity)
+                .unwrap_or_default();
             subagents.push(SubAgent {
-                name,
-                status,
-                tokens,
+                name: truncate(&super::sanitize_terminal_text(description), 30),
+                status: if since.as_secs() < 30 {
+                    "working"
+                } else {
+                    "done"
+                }
+                .into(),
+                tokens: transcript.tokens,
+                model: transcript.model.clone(),
+                context_tokens: transcript.context_tokens,
+                context_window: subagent_context_window(&transcript.model),
             });
         }
-
+        self.subagent_cache
+            .retain(|path, _| path.parent() != Some(subagents_dir) || seen.contains(path));
         subagents
+    }
+
+    fn read_subagent_transcript(&mut self, path: &Path) -> SubAgentTranscript {
+        let metadata = if !is_symlink(path) {
+            fs::metadata(path).ok()
+        } else {
+            None
+        };
+        let Some(metadata) = metadata else {
+            self.subagent_cache.remove(path);
+            return SubAgentTranscript::default();
+        };
+        let identity = file_identity(path);
+        let mut cached = self.subagent_cache.remove(path).unwrap_or_default();
+        if cached.file_identity != identity || metadata.len() < cached.offset {
+            cached = SubAgentTranscript::default();
+        }
+        if metadata.len() != cached.offset {
+            let delta = parse_transcript(path, cached.offset);
+            // A disappearing/unreadable file must not leave stale metrics.
+            if delta.file_identity == (0, 0) || delta.last_activity == std::time::UNIX_EPOCH {
+                return SubAgentTranscript::default();
+            }
+            if delta.model != "-" {
+                cached.model = delta.model;
+            }
+            cached.tokens += delta.total_input
+                + delta.total_output
+                + delta.total_cache_read
+                + delta.total_cache_create;
+            if delta.has_context_usage {
+                cached.context_tokens = Some(delta.last_context_tokens);
+            }
+            cached.offset = delta.new_offset;
+        }
+        cached.file_identity = identity;
+        cached.last_activity = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+        self.subagent_cache
+            .insert(path.to_path_buf(), cached.clone());
+        cached
     }
 
     fn collect_memory_status(memory_dir: &Path) -> (u32, u32) {
@@ -1241,6 +1271,57 @@ fn find_session_file_for_pid(sessions_dir: &Path, pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// The cache retains metrics only, never subagent prompts or tool contents.
+#[derive(Clone)]
+struct SubAgentTranscript {
+    model: String,
+    tokens: u64,
+    context_tokens: Option<u64>,
+    offset: u64,
+    file_identity: (u64, u64),
+    last_activity: std::time::SystemTime,
+}
+
+impl Default for SubAgentTranscript {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            tokens: 0,
+            context_tokens: None,
+            offset: 0,
+            file_identity: (0, 0),
+            last_activity: std::time::UNIX_EPOCH,
+        }
+    }
+}
+
+fn valid_context_usage(usage: &Value) -> bool {
+    usage.get("input_tokens").and_then(Value::as_u64).is_some()
+        && [
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ]
+        .iter()
+        .all(|key| usage.get(key).is_none_or(|v| v.as_u64().is_some()))
+}
+
+/// Only known capacities or an explicit transcript suffix are trustworthy.
+/// Do not inherit the parent setting or infer 1M from a high-water mark.
+fn subagent_context_window(model: &str) -> Option<u64> {
+    if model.starts_with("claude-") && model.ends_with("[1m]") {
+        return Some(super::context_window_for_model(model, "", 0));
+    }
+    let base = model.strip_prefix("claude-")?;
+    let base = base.strip_suffix("-20250929").unwrap_or(base);
+    let base = base.strip_suffix("-20251001").unwrap_or(base);
+    if matches!(base, "opus-4-6" | "sonnet-4-6" | "sonnet-4-5" | "haiku-4-5") {
+        Some(super::context_window_for_model(model, "", 0))
+    } else {
+        None
+    }
+}
+
 struct TranscriptResult {
     model: String,
     total_input: u64,
@@ -1249,6 +1330,7 @@ struct TranscriptResult {
     total_cache_create: u64,
     /// Last assistant turn's input context size (for context % calculation)
     last_context_tokens: u64,
+    has_context_usage: bool,
     /// High-water mark: largest context seen in any turn (for 1M detection)
     max_context_tokens: u64,
     /// cache_read from the previous turn (for compaction detection)
@@ -1341,6 +1423,7 @@ fn parse_transcript_with_previous(
         total_cache_read: 0,
         total_cache_create: 0,
         last_context_tokens: 0,
+        has_context_usage: false,
         max_context_tokens: 0,
         prev_cache_read: 0,
         context_history: Vec::new(),
@@ -1467,8 +1550,12 @@ fn parse_transcript_with_previous(
                             // don't persist when latest turn has no tool_use
                             result.current_task = String::new();
                             if let Some(msg) = val.get("message") {
-                                if let Some(m) = msg.get("model").and_then(|m| m.as_str()) {
-                                    result.model = m.to_string();
+                                if let Some(m) = msg.get("model").and_then(Value::as_str) {
+                                    let m = super::sanitize_terminal_text(m);
+                                    let m = m.trim();
+                                    if !m.is_empty() && m != "-" && m != "<synthetic>" {
+                                        result.model = m.to_string();
+                                    }
                                 }
                                 if let Some(usage) = msg.get("usage") {
                                     let inp = usage
@@ -1491,37 +1578,40 @@ fn parse_transcript_with_previous(
                                     result.total_output += out;
                                     result.total_cache_read += cr;
                                     result.total_cache_create += cc;
-                                    // Context = input_tokens + cache_read (excludes cache_creation, #54)
-                                    // Exception: when cache_read = 0 but cache_creation > 0,
-                                    // this is a fresh session creating cache for the first time,
-                                    // so cache_creation represents the actual context size.
-                                    let prev_context = prev_context_tokens;
-                                    let current_context = if cr == 0 && cc > 0 {
-                                        inp + cc
-                                    } else {
-                                        inp + cr
-                                    };
-                                    result.last_context_tokens = current_context;
-                                    if result.last_context_tokens > result.max_context_tokens {
-                                        result.max_context_tokens = result.last_context_tokens;
-                                    }
-                                    // Detect compaction: context drops > 30% between turns
-                                    // AND cache_read drops hard (old cache invalidated).
-                                    // This avoids false positives from normal cache hit rate
-                                    // fluctuations where total context varies but no
-                                    // actual conversation truncation occurred.
-                                    if prev_context > 0
-                                        && result.last_context_tokens < prev_context * 7 / 10
-                                        && prev_cache_read > 1000
-                                        && cr < prev_cache_read / 5
-                                    {
-                                        result.compaction_count += 1;
-                                    }
-                                    prev_context_tokens = current_context;
-                                    prev_cache_read = cr;
-                                    result.prev_cache_read = cr;
-                                    if result.context_history.len() < 10_000 {
-                                        result.context_history.push(result.last_context_tokens);
+                                    if valid_context_usage(usage) {
+                                        result.has_context_usage = true;
+                                        // Context = input_tokens + cache_read (excludes cache_creation, #54)
+                                        // Exception: when cache_read = 0 but cache_creation > 0,
+                                        // this is a fresh session creating cache for the first time,
+                                        // so cache_creation represents the actual context size.
+                                        let prev_context = prev_context_tokens;
+                                        let current_context = if cr == 0 && cc > 0 {
+                                            inp + cc
+                                        } else {
+                                            inp + cr
+                                        };
+                                        result.last_context_tokens = current_context;
+                                        if result.last_context_tokens > result.max_context_tokens {
+                                            result.max_context_tokens = result.last_context_tokens;
+                                        }
+                                        // Detect compaction: context drops > 30% between turns
+                                        // AND cache_read drops hard (old cache invalidated).
+                                        // This avoids false positives from normal cache hit rate
+                                        // fluctuations where total context varies but no
+                                        // actual conversation truncation occurred.
+                                        if prev_context > 0
+                                            && result.last_context_tokens < prev_context * 7 / 10
+                                            && prev_cache_read > 1000
+                                            && cr < prev_cache_read / 5
+                                        {
+                                            result.compaction_count += 1;
+                                        }
+                                        prev_context_tokens = current_context;
+                                        prev_cache_read = cr;
+                                        result.prev_cache_read = cr;
+                                        if result.context_history.len() < 10_000 {
+                                            result.context_history.push(result.last_context_tokens);
+                                        }
                                     }
                                     if result.token_history.len() < 10_000 {
                                         result.token_history.push(inp + out + cr + cc);
@@ -1732,16 +1822,22 @@ fn parse_transcript_with_previous(
 ///    invoke the model, so treating them as a prompt would leave
 ///    `last_user_ts_ms` stuck and pin the session in Thinking forever.
 fn is_synthetic_user_msg(entry: &Value) -> bool {
-    if entry.get("isMeta").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if entry
+        .get("isMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return true;
     }
-    let Some(message) = entry.get("message") else { return false };
+    let Some(message) = entry.get("message") else {
+        return false;
+    };
     match message.get("content") {
         Some(Value::Array(arr)) => {
             !arr.is_empty()
-                && arr.iter().all(|block| {
-                    block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                })
+                && arr
+                    .iter()
+                    .all(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
         }
         Some(Value::String(s)) => {
             let t = s.trim_start();
@@ -2364,15 +2460,18 @@ mod tests {
         // forever (Think generating reply). All three line shapes must be
         // treated as synthetic.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            // Real prompt + assistant reply to seed a clean Wait state.
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
-            // The three user-role lines `/plugin update` writes:
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                // Real prompt + assistant reply to seed a clean Wait state.
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:00Z","message":{"role":"user","content":"hi"}}"#,
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:01Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"hello"}]}}"#,
+                // The three user-role lines `/plugin update` writes:
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat: ...</local-command-caveat>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<command-name>/plugin</command-name>\n<command-args>update foo</command-args>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:01:00Z","message":{"role":"user","content":"<local-command-stdout>Updated foo</local-command-stdout>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -2390,11 +2489,14 @@ mod tests {
         // `!ls` and friends serialize as <bash-input>/<bash-stdout> user-role
         // lines with no assistant reply. Same failure mode as /plugin.
         let mut file = tempfile::NamedTempFile::new().unwrap();
-        write_lines(&mut file, &[
-            r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
-            r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
-        ]);
+        write_lines(
+            &mut file,
+            &[
+                r#"{"type":"assistant","timestamp":"2026-03-28T15:00:00Z","message":{"model":"claude-sonnet-4-6","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-input>ls</bash-input>"}}"#,
+                r#"{"type":"user","timestamp":"2026-03-28T15:00:05Z","message":{"role":"user","content":"<bash-stdout>a\nb</bash-stdout><bash-stderr></bash-stderr>"}}"#,
+            ],
+        );
 
         let result = parse_transcript(file.path(), 0);
 
@@ -3176,7 +3278,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
     #[test]
     fn test_context_window_for_model() {
         // Base model with low token usage → 200K
-        assert_eq!(crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("claude-opus-4-6", "", 50_000),
+            200_000
+        );
         // Explicit [1m] suffix in transcript model → 1M regardless of token count
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6[1m]", "", 0),
@@ -3191,7 +3296,10 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
             crate::collector::context_window_for_model("claude-sonnet-4-6", "", 100_000),
             200_000
         );
-        assert_eq!(crate::collector::context_window_for_model("unknown-model", "", 0), 200_000);
+        assert_eq!(
+            crate::collector::context_window_for_model("unknown-model", "", 0),
+            200_000
+        );
         // Token usage exceeds 200K → must be 1M window
         assert_eq!(
             crate::collector::context_window_for_model("claude-opus-4-6", "", 250_000),
@@ -3661,6 +3769,202 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         );
     }
 
+    fn append_subagent_record(path: &Path, record: Value) {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "{record}").unwrap();
+    }
+
+    #[test]
+    fn subagent_cache_tracks_latest_valid_model_usage_and_partial_lines() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-test.jsonl");
+        append_subagent_record(
+            &path,
+            serde_json::json!({"type":"assistant", "message":{
+                "model":"claude-sonnet-4-6", "usage":{"input_tokens":10,"output_tokens":3,"cache_creation_input_tokens":90}
+            }}),
+        );
+        let mut collector = ClaudeCollector::new();
+        let first = collector.collect_subagents(dir.path());
+        assert_eq!(first[0].name, "agent-test", "metadata is optional");
+        assert_eq!(
+            first[0].context_tokens,
+            Some(100),
+            "reuse fresh-cache context calculation"
+        );
+        assert_eq!(first[0].tokens, 103);
+        let offset = collector.subagent_cache[&path].offset;
+        let again = collector.collect_subagents(dir.path());
+        assert_eq!(again[0].tokens, 103, "no-op tick must not recount");
+        assert_eq!(collector.subagent_cache[&path].offset, offset);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                b"not-json\n{\"type\":\"assistant\",\"message\":{\"model\":\"claude-opus-4-6\",",
+            )
+            .unwrap();
+        let partial = collector.collect_subagents(dir.path());
+        assert_eq!(partial[0].model, "claude-sonnet-4-6");
+        assert_eq!(collector.subagent_cache[&path].offset, offset + 9);
+        fs::OpenOptions::new().append(true).open(&path).unwrap()
+            .write_all(b"\"usage\":{\"input_tokens\":5,\"output_tokens\":2,\"cache_read_input_tokens\":45,\"cache_creation_input_tokens\":45}}}\n").unwrap();
+        let updated = collector.collect_subagents(dir.path());
+        assert_eq!(updated[0].model, "claude-opus-4-6");
+        assert_eq!(
+            updated[0].context_tokens,
+            Some(50),
+            "cache creation must not double context"
+        );
+        assert_eq!(updated[0].tokens, 200);
+        for message in [
+            serde_json::json!({"model":"", "usage":null}),
+            serde_json::json!({"model":null, "usage":{"input_tokens":"bad"}}),
+            serde_json::json!({"model":"<synthetic>", "usage":{}}),
+            serde_json::json!({"usage":{"input_tokens":999, "cache_read_input_tokens":"bad"}}),
+        ] {
+            append_subagent_record(
+                &path,
+                serde_json::json!({"type":"assistant", "message":message}),
+            );
+        }
+        append_subagent_record(
+            &path,
+            serde_json::json!({"type":"user", "message":{"model":"wrong-parent"}}),
+        );
+        let latest = collector.collect_subagents(dir.path());
+        assert_eq!(latest[0].model, "claude-opus-4-6");
+        assert_eq!(latest[0].context_tokens, Some(50));
+        append_subagent_record(
+            &path,
+            serde_json::json!({"type":"assistant", "message":{
+                "model":"claude-future-7-2", "usage":{"input_tokens":0,"output_tokens":0}
+            }}),
+        );
+        let zero = collector.collect_subagents(dir.path());
+        assert_eq!(zero[0].model, "claude-future-7-2");
+        assert_eq!(zero[0].context_tokens, Some(0), "zero is valid usage");
+        assert_eq!(
+            zero[0].context_window, None,
+            "new models must not inherit a capacity"
+        );
+        assert_eq!(zero[0].tokens, 1199);
+    }
+
+    #[test]
+    fn subagent_missing_model_usage_and_bad_metadata_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("agent-empty.jsonl"), "").unwrap();
+        fs::write(dir.path().join("agent-empty.meta.json"), "{").unwrap();
+        fs::write(
+            dir.path().join("agent-sidecar.meta.json"),
+            r#"{"description":"Metadata only"}"#,
+        )
+        .unwrap();
+        append_subagent_record(
+            &dir.path().join("agent-model.jsonl"),
+            serde_json::json!({
+                "type":"assistant", "message":{"model":"claude-future-8-1"}
+            }),
+        );
+        append_subagent_record(
+            &dir.path().join("agent-usage.jsonl"),
+            serde_json::json!({
+                "type":"assistant", "message":{"usage":{"input_tokens":25,"cache_read_input_tokens":75,"output_tokens":4}}
+            }),
+        );
+        let mut collector = ClaudeCollector::new();
+        let agents = collector.collect_subagents(dir.path());
+        assert_eq!(agents.len(), 4);
+        let empty = agents.iter().find(|a| a.name == "agent-empty").unwrap();
+        assert!(empty.model.is_empty());
+        assert_eq!(empty.context_tokens, None);
+        let model = agents.iter().find(|a| a.name == "agent-model").unwrap();
+        assert_eq!(model.model, "claude-future-8-1");
+        assert_eq!(model.context_tokens, None);
+        let usage = agents.iter().find(|a| a.name == "agent-usage").unwrap();
+        assert!(usage.model.is_empty());
+        assert_eq!(usage.context_tokens, Some(100));
+        assert_eq!(usage.context_window, None);
+        assert_eq!(usage.tokens, 104);
+    }
+
+    #[test]
+    fn subagent_cache_resets_on_rotation_truncation_and_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent-rotate.jsonl");
+        let mut collector = ClaudeCollector::new();
+        append_subagent_record(
+            &path,
+            serde_json::json!({"type":"assistant", "message":{
+                "model":"claude-sonnet-4-6", "usage":{"input_tokens":10,"output_tokens":2}
+            }}),
+        );
+        assert_eq!(collector.collect_subagents(dir.path())[0].tokens, 12);
+        fs::rename(&path, dir.path().join("old-transcript")).unwrap();
+        append_subagent_record(
+            &path,
+            serde_json::json!({"type":"assistant", "message":{
+                "model":"claude-future-12345", "usage":{"input_tokens":20,"output_tokens":4}
+            }}),
+        );
+        let rotated = collector.collect_subagents(dir.path());
+        assert_eq!(rotated[0].tokens, 24);
+        assert_eq!(rotated[0].model, "claude-future-12345");
+        fs::write(&path, "").unwrap();
+        let truncated = collector.collect_subagents(dir.path());
+        assert_eq!(truncated[0].tokens, 0);
+        assert_eq!(truncated[0].context_tokens, None);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(collector.read_subagent_transcript(&path).tokens, 0);
+        assert!(collector.subagent_cache.is_empty());
+        assert!(collector.collect_subagents(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn subagent_caches_are_isolated_by_path_and_evicted_with_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut collector = ClaudeCollector::new();
+        for (session, model) in [
+            ("session-a", "claude-opus-4-6"),
+            ("session-b", "claude-haiku-4-5"),
+        ] {
+            let agents_dir = dir.path().join(session).join("subagents");
+            fs::create_dir_all(&agents_dir).unwrap();
+            let path = agents_dir.join("agent-same-id.jsonl");
+            append_subagent_record(
+                &path,
+                serde_json::json!({"type":"assistant", "message":{"model":model}}),
+            );
+            assert_eq!(collector.collect_subagents(&agents_dir)[0].model, model);
+        }
+        assert_eq!(collector.subagent_cache.len(), 2);
+        collector.evict_stale_cache(&[]);
+        assert!(collector.subagent_cache.is_empty());
+    }
+
+    #[test]
+    fn subagent_capacity_requires_known_model_or_explicit_suffix() {
+        assert_eq!(subagent_context_window("claude-sonnet-4-6"), Some(200_000));
+        assert_eq!(
+            subagent_context_window("claude-opus-4-6[1m]"),
+            Some(1_000_000)
+        );
+        assert_eq!(
+            subagent_context_window("claude-haiku-4-5-20251001"),
+            Some(200_000)
+        );
+        assert_eq!(subagent_context_window("claude-future-9-0"), None);
+        assert_eq!(subagent_context_window(""), None);
+    }
+
     #[test]
     fn test_load_session_working_async_subagent_is_executing() {
         // Regression for #156: an async Agent tool returns immediately, so the
@@ -3707,6 +4011,19 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
 "#,
         )
         .unwrap();
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&subagent_transcript)
+                .unwrap();
+            writeln!(file, "{}", serde_json::json!({"type":"assistant", "message":{
+                "model":"claude-opus-4-6", "usage":{"input_tokens":20,"output_tokens":5,"cache_read_input_tokens":80}
+            }})).unwrap();
+            writeln!(file, "{}", serde_json::json!({"type":"assistant", "message":{
+                "model":"claude-haiku-4-5", "usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":40}
+            }})).unwrap();
+        }
         set_mtime(&subagent_transcript, 0);
 
         let config = ConfigDir::new(profile.clone());
@@ -3727,10 +4044,52 @@ n/Users/bob/.claude-alt/projects/-Users-bob-project/session.jsonl
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].subagents.len(), 1);
         assert_eq!(sessions[0].subagents[0].status, "working");
+        assert_eq!(sessions[0].model, "claude-sonnet-4-6");
+        assert_eq!(sessions[0].subagents[0].model, "claude-haiku-4-5");
+        assert_eq!(sessions[0].subagents[0].context_tokens, Some(50));
+        assert_eq!(sessions[0].subagents[0].tokens, 157);
+        assert_eq!(
+            sessions[0].total_tokens(),
+            4,
+            "child tokens must not be added to parent"
+        );
         assert_eq!(
             sessions[0].status,
             SessionStatus::Executing,
             "a working async subagent must keep its parent Executing",
+        );
+        fs::write(subagents_dir.join("agent-no-metrics.jsonl"), "").unwrap();
+        let refreshed = collector.load_session_paths(
+            &session_paths,
+            &process_info,
+            &HashMap::new(),
+            &HashMap::new(),
+            &ctx,
+        );
+        let missing = refreshed[0]
+            .subagents
+            .iter()
+            .find(|a| a.name == "agent-no-metrics")
+            .unwrap();
+        assert!(
+            missing.model.is_empty(),
+            "missing model must not inherit the parent's Sonnet model"
+        );
+        assert_eq!(missing.context_tokens, None);
+        assert_eq!(missing.context_window, None);
+        assert_eq!(
+            refreshed[0].total_tokens(),
+            4,
+            "refresh must not double-count parent tokens"
+        );
+        let child = refreshed[0]
+            .subagents
+            .iter()
+            .find(|a| a.name == "research")
+            .unwrap();
+        assert_eq!(
+            child.tokens, 157,
+            "refresh must not double-count child tokens"
         );
     }
 

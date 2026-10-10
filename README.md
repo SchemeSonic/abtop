@@ -61,6 +61,20 @@ abtop --mouse            # Enable mouse click/scroll navigation
 Recommended terminal size: **120x40** or larger. Minimum 80x24 — panels hide gracefully when small.
 Mouse capture is off by default so terminal drag selection and copy keep working. Launch with `--mouse` if you prefer click targets and wheel navigation.
 
+### Subagent models and context
+
+Select a Claude Code session to see each agent's name, status, model, current
+context (`CTX`), and cumulative tokens (`Tok`) in **SUBAGENTS**. Models and
+context come from each subagent's own latest valid assistant records, including
+live updates. The same fields appear in `--once` and `--json` snapshots.
+
+Context is separate from cumulative tokens. Known capacities display a
+percentage; unfamiliar models display the current context token count instead.
+Missing model or usage displays `—`. The parent model and its `[1m]` setting
+are never inherited. Narrow panels shorten names and omit totals before model
+information. On narrow terminals, subagents take priority over chat history in
+the selected session's default detail view.
+
 ### Terminal Jump
 
 Press `Enter` to focus the terminal running the selected agent. abtop supports cmux, tmux, and iTerm2 on macOS.

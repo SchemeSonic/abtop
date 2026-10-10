@@ -101,6 +101,12 @@ pub struct SubAgent {
     pub name: String,
     pub status: String,
     pub tokens: u64,
+    /// Latest valid model from this agent's own transcript; empty if unknown.
+    pub model: String,
+    /// Latest input context, distinct from cumulative token accounting.
+    pub context_tokens: Option<u64>,
+    /// Known capacity only; never inferred from the parent or token totals.
+    pub context_window: Option<u64>,
 }
 
 /// A single tool invocation from a session transcript.

@@ -64,12 +64,18 @@ pub fn populate_demo(app: &mut App) {
 
                     status: "done".into(),
                     tokens: 12_400,
+                    model: "claude-haiku-4-5".into(),
+                    context_tokens: Some(6_000),
+                    context_window: Some(200_000),
                 },
                 SubAgent {
                     name: "Run integration tests".into(),
 
                     status: "working".into(),
                     tokens: 8_200,
+                    model: "claude-sonnet-4-6".into(),
+                    context_tokens: Some(4_000),
+                    context_window: Some(200_000),
                 },
             ],
             mem_file_count: 4,

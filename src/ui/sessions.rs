@@ -1,6 +1,6 @@
 use crate::app::App;
 use crate::locale::t;
-use crate::model::{AgentSession, ChatRole, FileOp};
+use crate::model::{AgentSession, ChatRole, FileOp, SubAgent};
 use crate::theme::Theme;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -323,9 +323,15 @@ pub(crate) fn draw_sessions_panel_active(
                     Cell::from(Span::styled(icon, Style::default().fg(sa_fg))),
                 ]);
                 if show_model {
-                    sa_cells.push(Cell::from(""));
+                    sa_cells.push(Cell::from(Span::styled(
+                        truncate_str(&subagent_model(sa), model_w as usize),
+                        Style::default().fg(theme.graph_text),
+                    )));
                 }
-                sa_cells.push(Cell::from(""));
+                sa_cells.push(Cell::from(Span::styled(
+                    subagent_context(sa),
+                    Style::default().fg(theme.graph_text),
+                )));
                 if show_tokens {
                     sa_cells.push(Cell::from(Span::styled(
                         fmt_tokens(sa.tokens),
@@ -514,8 +520,12 @@ pub(crate) fn draw_sessions_panel_active(
             return;
         }
 
-        // Reserve bottom lines for MEM + version
-        let footer_h = 3u16;
+        // In compact Work panels, keep subagent rows ahead of memory/version.
+        let footer_h = if !session.subagents.is_empty() && detail_area.height < 8 {
+            0
+        } else {
+            3u16
+        };
         let detail_body_h = detail_area.height.saturating_sub(footer_h);
         let detail_body = Rect {
             x: detail_area.x,
@@ -548,7 +558,7 @@ pub(crate) fn draw_sessions_panel_active(
         let chat_default = !file_audit_focused && !app.show_timeline && has_chat;
         let chat_side_by_side =
             chat_default && has_left_detail && detail_body.width >= CHAT_SPLIT_MIN_WIDTH;
-        let chat_full_width = chat_default && !chat_side_by_side;
+        let chat_full_width = chat_default && !has_subagents && !chat_side_by_side;
         const TIMELINE_SPLIT_MIN_WIDTH: u16 = 120;
         let timeline_default = !file_audit_focused
             && !app.show_timeline
@@ -656,7 +666,9 @@ pub(crate) fn draw_sessions_panel_active(
                 }
 
                 if has_children || has_subagents {
-                    let body_chunks = if has_children && has_subagents {
+                    // Avoid spending the only remaining rows on two headings.
+                    let show_children = has_children && (!has_subagents || left_area.height >= 4);
+                    let body_chunks = if show_children && has_subagents {
                         if left_area.width < 90 {
                             Layout::default()
                                 .direction(Direction::Vertical)
@@ -682,7 +694,7 @@ pub(crate) fn draw_sessions_panel_active(
                     };
 
                     // Children (left side)
-                    if has_children {
+                    if show_children {
                         let children_area = body_chunks[0];
                         let mut lines = Vec::new();
                         lines.push(Line::from(Span::styled(
@@ -722,7 +734,7 @@ pub(crate) fn draw_sessions_panel_active(
 
                     // Subagents (right side, or full width if no children)
                     if has_subagents {
-                        let sa_area = if has_children {
+                        let sa_area = if show_children {
                             body_chunks[1]
                         } else {
                             body_chunks[0]
@@ -737,90 +749,25 @@ pub(crate) fn draw_sessions_panel_active(
                         )));
 
                         let col_w = sa_area.width as usize;
-                        let use_two_cols = session.subagents.len() > 6 && col_w >= 50;
-
+                        // Each column needs space for status, model, context and totals.
+                        let use_two_cols = session.subagents.len() > 6 && col_w >= 100;
                         if use_two_cols {
                             let half_w = col_w / 2;
-                            let name_w = half_w.saturating_sub(12);
                             let mid = session.subagents.len().div_ceil(2);
-                            let left_agents = &session.subagents[..mid];
-                            let right_agents = &session.subagents[mid..];
-
-                            for (row_idx, sa) in left_agents.iter().enumerate() {
-                                let mut spans = Vec::new();
-                                // Left column
-                                let icon = if sa.status == "working" { "●" } else { "✓" };
-                                let fg = if sa.status == "working" {
-                                    theme.main_fg
-                                } else {
-                                    theme.graph_text
-                                };
-                                spans.push(Span::styled(
-                                    format!(
-                                        "  {} {:<w$}",
-                                        icon,
-                                        truncate_str(&sa.name, name_w),
-                                        w = name_w
-                                    ),
-                                    Style::default().fg(fg),
-                                ));
-                                spans.push(Span::styled(
-                                    format!("{:>6}", fmt_tokens(sa.tokens)),
-                                    Style::default().fg(theme.graph_text),
-                                ));
-
-                                // Right column
-                                if let Some(sa_r) = right_agents.get(row_idx) {
-                                    let icon_r = if sa_r.status == "working" {
-                                        "●"
-                                    } else {
-                                        "✓"
-                                    };
-                                    let fg_r = if sa_r.status == "working" {
-                                        theme.main_fg
-                                    } else {
-                                        theme.graph_text
-                                    };
-                                    spans.push(Span::styled(
-                                        format!(
-                                            "  {} {:<w$}",
-                                            icon_r,
-                                            truncate_str(&sa_r.name, name_w),
-                                            w = name_w
-                                        ),
-                                        Style::default().fg(fg_r),
-                                    ));
-                                    spans.push(Span::styled(
-                                        format!("{:>6}", fmt_tokens(sa_r.tokens)),
-                                        Style::default().fg(theme.graph_text),
-                                    ));
+                            let (left, right) = session.subagents.split_at(mid);
+                            for (row_idx, sa) in left.iter().enumerate() {
+                                let mut line = subagent_line(sa, half_w, theme);
+                                let padding = half_w.saturating_sub(line.width());
+                                line.spans.push(Span::raw(" ".repeat(padding)));
+                                if let Some(sa) = right.get(row_idx) {
+                                    line.spans
+                                        .extend(subagent_line(sa, col_w - half_w, theme).spans);
                                 }
-                                lines.push(Line::from(spans));
+                                lines.push(line);
                             }
                         } else {
-                            let name_w = col_w.saturating_sub(12);
                             for sa in &session.subagents {
-                                let icon = if sa.status == "working" { "●" } else { "✓" };
-                                let fg = if sa.status == "working" {
-                                    theme.main_fg
-                                } else {
-                                    theme.graph_text
-                                };
-                                lines.push(Line::from(vec![
-                                    Span::styled(
-                                        format!(
-                                            "  {} {:<w$}",
-                                            icon,
-                                            truncate_str(&sa.name, name_w),
-                                            w = name_w
-                                        ),
-                                        Style::default().fg(fg),
-                                    ),
-                                    Span::styled(
-                                        format!("{:>6}", fmt_tokens(sa.tokens)),
-                                        Style::default().fg(theme.graph_text),
-                                    ),
-                                ]));
+                                lines.push(subagent_line(sa, col_w, theme));
                             }
                         }
                         f.render_widget(Paragraph::new(lines), sa_area);
@@ -989,6 +936,66 @@ fn draw_file_audit(f: &mut Frame, session: &AgentSession, area: Rect, theme: &Th
 
 fn task_row_text(task_text: &str, max_width: usize) -> String {
     truncate_str(&format!("└─ {task_text}"), max_width)
+}
+
+pub(crate) fn subagent_model(agent: &SubAgent) -> String {
+    if agent.model.is_empty() {
+        "—".into()
+    } else {
+        shorten_model(&agent.model, agent.context_window == Some(1_000_000))
+    }
+}
+
+pub(crate) fn subagent_context(agent: &SubAgent) -> String {
+    match (agent.context_tokens, agent.context_window) {
+        (Some(tokens), Some(capacity)) if capacity > 0 => {
+            format!("{:.0}%", tokens as f64 / capacity as f64 * 100.0)
+        }
+        (Some(tokens), _) => fmt_tokens(tokens),
+        _ => "—".into(),
+    }
+}
+
+/// Fit by terminal display cells, reserving the model before the name.
+/// At small widths drop totals first, then context; retain status and model.
+fn subagent_line(agent: &SubAgent, width: usize, theme: &Theme) -> Line<'static> {
+    let working = agent.status == "working";
+    let icon = if working { "●" } else { "✓" };
+    let fg = if working {
+        theme.main_fg
+    } else {
+        theme.graph_text
+    };
+    let model = subagent_model(agent);
+    let model_w = unicode_width::UnicodeWidthStr::width(model.as_str());
+    let context = format!(" CTX:{}", subagent_context(agent));
+    let total = format!(" Tok:{}", fmt_tokens(agent.tokens));
+    let mut suffix = String::new();
+    // Reserve at least four cells for an abbreviated name when possible.
+    if width >= 3 + model_w + 1 + 4 + context.len() {
+        suffix.push_str(&context);
+        if width >= 3 + model_w + 1 + 4 + context.len() + total.len() {
+            suffix.push_str(&total);
+        }
+    }
+    let available = width.saturating_sub(3 + suffix.chars().count());
+    let model_w = model_w.min(available);
+    let name_w = available.saturating_sub(model_w + 1);
+    let name = truncate_str(&agent.name, name_w);
+    let name_width = unicode_width::UnicodeWidthStr::width(name.as_str());
+    let text = if name_w > 0 {
+        format!(
+            " {icon} {name}{} {}{suffix}",
+            " ".repeat(name_w.saturating_sub(name_width)),
+            truncate_str(&model, model_w)
+        )
+    } else {
+        format!(" {icon} {}{suffix}", truncate_str(&model, model_w))
+    };
+    Line::from(Span::styled(
+        truncate_str(&text, width),
+        Style::default().fg(fg),
+    ))
 }
 
 pub(crate) fn shorten_model(model: &str, is_1m: bool) -> String {
@@ -1257,6 +1264,146 @@ mod tests {
     use crate::model::{LaunchSurface, SessionStatus};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    fn test_subagent(model: &str, context: Option<u64>, capacity: Option<u64>) -> SubAgent {
+        SubAgent {
+            name: "Investigate full-width ＡＢＣＤ characters and a long task name".into(),
+            status: "working".into(),
+            tokens: 123_456,
+            model: model.into(),
+            context_tokens: context,
+            context_window: capacity,
+        }
+    }
+
+    #[test]
+    fn subagent_display_uses_generic_model_names_and_honest_context() {
+        let mut agent = test_subagent("claude-sonnet-5-5", Some(47_375), None);
+        assert_eq!(subagent_model(&agent), "sonnet5.5");
+        assert_eq!(subagent_context(&agent), "47.4k");
+        agent.model = "claude-new-family-9-2".into();
+        assert_eq!(subagent_model(&agent), "new-family9.2");
+        agent.model.clear();
+        agent.context_tokens = None;
+        assert_eq!(subagent_model(&agent), "—");
+        assert_eq!(subagent_context(&agent), "—");
+        agent.context_tokens = Some(0);
+        assert_eq!(subagent_context(&agent), "0");
+        agent.model = "claude-opus-4-6[1m]".into();
+        agent.context_tokens = Some(500_000);
+        agent.context_window = Some(1_000_000);
+        assert_eq!(subagent_model(&agent), "opus4.6[1m]");
+        assert_eq!(subagent_context(&agent), "50%");
+    }
+
+    #[test]
+    fn subagent_rows_fit_display_width_and_prioritize_model() {
+        let agent = test_subagent("claude-sonnet-5-5", Some(47_375), None);
+        for width in 0..=160 {
+            let line = subagent_line(&agent, width, &Theme::default());
+            assert!(line.width() <= width, "row exceeds {width} display cells");
+            let text = line.to_string();
+            if width >= 14 {
+                assert!(
+                    text.contains("sonnet5.5"),
+                    "model lost at width {width}: {text}"
+                );
+                assert!(text.contains('●'));
+            }
+            if width >= 50 {
+                assert!(text.contains("CTX:47.4k"));
+                assert!(text.contains("Tok:123.5k"));
+            }
+        }
+    }
+
+    #[test]
+    fn subagents_render_with_chat_on_narrow_and_wide_panels() {
+        for width in [40, 60, 80, 100, 120, 160, 220] {
+            let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+            let mut session = test_session("subagent-session", "project");
+            session.subagents = vec![test_subagent("claude-sonnet-5-5", Some(47_375), None)];
+            session.chat_messages = vec![crate::model::ChatMessage {
+                role: ChatRole::Assistant,
+                text: "A sample response".into(),
+            }];
+            app.sessions.push(session);
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal
+                .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+                .unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("SUBAGENTS"),
+                "subagents hidden at {width}\n{text}"
+            );
+            assert!(
+                text.contains("sonnet5.5"),
+                "model hidden at {width}\n{text}"
+            );
+            assert!(
+                text.contains("CTX:47.4k"),
+                "unknown capacity hidden at {width}\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn full_compact_layout_reserves_a_subagent_row_with_multiple_sessions() {
+        for (width, height) in [(80, 24), (69, 27)] {
+            let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+            crate::demo::populate_demo(&mut app);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|f| crate::ui::draw(f, &app)).unwrap();
+            let text = format!("{}", terminal.backend());
+            assert!(
+                text.contains("SUBAGENTS"),
+                "subagents hidden at {width}x{height}\n{text}"
+            );
+            assert!(
+                text.contains("haiku4.5"),
+                "model hidden at {width}x{height}\n{text}"
+            );
+            assert!(
+                text.contains("CTX:3%"),
+                "context hidden at {width}x{height}\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_two_column_panel_keeps_both_models_visible() {
+        let mut app = App::new_with_config(Theme::default(), &[], PanelVisibility::default());
+        let mut session = test_session("subagent-session", "project");
+        session.subagents = (0..8)
+            .map(|index| {
+                let mut agent = test_subagent(
+                    if index < 4 {
+                        "claude-sonnet-5-5"
+                    } else {
+                        "claude-haiku-4-5"
+                    },
+                    Some(10_000),
+                    None,
+                );
+                agent.name = format!("task-{index}");
+                agent.status = "done".into();
+                agent
+            })
+            .collect();
+        app.sessions.push(session);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|f| draw_sessions_panel(f, &app, f.area(), &app.theme))
+            .unwrap();
+        let text = format!("{}", terminal.backend());
+        assert!(
+            text.contains("sonnet5.5") && text.contains("haiku4.5"),
+            "{text}"
+        );
+        assert!(text.contains("task-0") && text.contains("task-7"), "{text}");
+        assert!(text.contains('✓'));
+    }
 
     #[test]
     fn codex_exec_command_uses_bash_color() {
